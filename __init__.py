@@ -293,7 +293,11 @@ class Krea2EditModelPatch:
                   f"'vae' and 'source_image' connected (the pixel path). Falling back to the "
                   f"latent crop path.", flush=True)
 
-        def wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options={}, **kwargs):
+        # ref_latents (upstream c9602625) sits between attention_mask and transformer_options in
+        # SingleStreamDiT.forward's positional call. This node builds its own reference sequence
+        # (source latent as frame=1 tokens), so it accepts and ignores ref_latents — but the slot
+        # MUST exist and be in this exact position, else transformer_options binds to the wrong arg.
+        def wrapper(executor, x, timesteps, context, attention_mask=None, ref_latents=None, transformer_options={}, **kwargs):
             dm = executor.class_obj  # the SingleStreamDiT instance
             src = src_samples
             if vae is not None and source_image is not None:
