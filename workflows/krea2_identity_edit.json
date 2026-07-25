@@ -2,7 +2,7 @@
   "id": "krea2-identity-edit-unified",
   "revision": 0,
   "last_node_id": 110,
-  "last_link_id": 26,
+  "last_link_id": 27,
   "nodes": [
     {
       "id": 29,
@@ -452,6 +452,12 @@
           "shape": 7,
           "type": "IMAGE",
           "link": 20
+        },
+        {
+          "name": "target_latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 27
         }
       ],
       "outputs": [
@@ -509,7 +515,8 @@
           "name": "LATENT",
           "type": "LATENT",
           "links": [
-            24
+            24,
+            27
           ]
         }
       ],
@@ -1174,6 +1181,14 @@
       29,
       0,
       "IMAGE"
+    ],
+    [
+      27,
+      82,
+      0,
+      79,
+      7,
+      "LATENT"
     ]
   ],
   "groups": [
