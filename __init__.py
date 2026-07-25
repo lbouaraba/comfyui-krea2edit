@@ -273,7 +273,12 @@ class Krea2EditModelPatch:
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit"):
+              source_image_b=None, fit_mode="fit", **_future):
+        if _future:
+            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
+                  f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
+                  f"installed node pack. Update comfyui-krea2edit (Manager -> Update, or git "
+                  f"pull) and restart ComfyUI. Continuing without them.", flush=True)
         m = model.clone()
         # The target latent reaches the diffusion model already scaled (process_latent_in);
         # scale the source(s) the same way so all share one latent space.
@@ -400,7 +405,11 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt=""):
+    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt="", **_future):
+        if _future:
+            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
+                  f"know ({', '.join(sorted(_future))}). Update comfyui-krea2edit and restart "
+                  f"ComfyUI. Continuing without them.", flush=True)
         if image is None:  # text-only fallback = old behavior
             tokens = clip.tokenize(prompt)
             return (clip.encode_from_tokens_scheduled(tokens),)

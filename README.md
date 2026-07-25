@@ -49,9 +49,10 @@ reading your instruction, exactly as during training. Inputs:
 - `prompt` — the edit instruction ("recolor the car to matte black")
 - `image` — the same source image
 - `image_b` *(optional)* — second reference for two-input edits
-- `grounding_px` — grounding resolution (default 768; trained range 512–1536).
-  This is a quality dial: lower = stronger edit adherence, higher = stronger
-  identity/likeness. Try 1024+ for people, 512 for stubborn scene changes.
+- `grounding_px` — grounding resolution (default 768; v1.2 trained range
+  384–768, and 1024+ often still works nicely). This is a quality dial: lower =
+  stronger edit adherence, higher = stronger identity/likeness. Try 1024 for
+  people, 512 for stubborn scene changes. (v1's trained range was 512–1536.)
 
 **Both nodes are required.** With a stock `CLIPTextEncode` the model never sees the
 image semantically and quality drops sharply, especially for scene-referential
