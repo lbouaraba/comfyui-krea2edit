@@ -214,10 +214,6 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     device = combined.device
     if pos_mode == "stride1" and ref_native:
         print(f"[krea2edit] STRIDE1-POS fit: ref grids {src_grids} centered in ({h_},{w_})", flush=True)
-        if any(h_ - gh > 2 or w_ - gw > 2 for gh, gw in src_grids):
-            print("[krea2edit] NOTE: fit margins >2 tokens (large source/output aspect-ratio "
-                  "gap). fit is trained for matched/near-matched AR; for a big AR change "
-                  "prefer 'crop', or set the output AR closer to the source.", flush=True)
         ref_ids = [_imgids_offset(bs, i + 1, gh, gw, h_, w_, device)
                    for i, (gh, gw) in enumerate(src_grids)]
     else:
