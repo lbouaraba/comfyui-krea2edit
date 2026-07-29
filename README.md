@@ -7,6 +7,8 @@ into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was t
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
+🧰 **Training code is public:** [krea2edit-trainer](https://github.com/lbouaraba/krea2edit-trainer) — the ai-toolkit extension these LoRAs were trained with, geometry-matched to the nodes, with measured consumer-GPU VRAM requirements.
+
 ## Model versions
 
 See [CHANGELOG.md](CHANGELOG.md) — **v1.2 is recommended** (better face likeness,
