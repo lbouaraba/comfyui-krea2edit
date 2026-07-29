@@ -40,7 +40,9 @@ def _imgids_offset(bs, frame, gh, gw, th, tw, device):
     pixels are already resampled to target grid density, so the position grid is
     stride-1 BY CONSTRUCTION — scaling it again only manufactures skip/collision
     artifacts. Requires gh<=th, gw<=tw (guaranteed by the floor+cap in fit)."""
-    off_h, off_w = max(0, (th - gh) // 2), max(0, (tw - gw) // 2)
+    # fractional center (2026-07-28): integer floor placed odd-gap refs 8px off
+    # their true center — RoPE is continuous, half-token positions are exact.
+    off_h, off_w = max(0.0, (th - gh) / 2), max(0.0, (tw - gw) / 2)
     ids = torch.zeros(gh, gw, 3, device=device, dtype=torch.float32)
     ids[..., 0] = frame
     ids[..., 1] = (torch.arange(gh, device=device, dtype=torch.float32) + off_h)[:, None]
@@ -110,6 +112,15 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
             # (train/infer geometry must be byte-identical). 2026-07-15 alignment.
             nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
             nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
+            # CROP-TO-GRID (2026-07-28 seam-doubling RCA): resizing ih*sc -> floor16
+            # SQUASHES content by up to 15px; the misregistration peaks exactly at
+            # the ref band edges — the outpaint seam — and renders as a doubled
+            # band (proven causal: 754px vs 753px input A/B, one pixel flips
+            # clean<->worst). Center-crop the source so the fitted axis lands on
+            # the /16 grid at scale sc EXACTLY: zero squash, stride-1 stays true.
+            ch2, cw2 = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
+            y0, x0 = (ih - ch2) // 2, (iw - cw2) // 2
+            img = img[..., y0:y0 + ch2, x0:x0 + cw2]
         img = F.interpolate(img.float(), size=(nh, nw), mode="bicubic", antialias=True)
         lat = vae.encode(img.movedim(1, -1)[..., :3].clamp(0, 1))
         cache[key] = lat
