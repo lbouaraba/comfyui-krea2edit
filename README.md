@@ -154,6 +154,8 @@ This is a solo project, made a lot better by the community. Thank you to:
 - **[SubtleShader](https://huggingface.co/SubtleShader)** — testing the training code and
   consumer-GPU feedback.
 - **Mark ([sogni.ai](https://sogni.ai))** — support, a GPU-fund donation, and getting the word out.
+- **[ethanfel](https://github.com/ethanfel)** — root-caused the pixel path's VRAM interaction with
+  the sampler and contributed the `target_latent` pre-encode (#15), tests included.
 
 Want to help? Contributions of training data and node/code work are welcome, see the discussions.
 
