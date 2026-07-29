@@ -320,7 +320,7 @@ class Krea2EditModelPatch:
         if vae is not None and source_image is not None:
             if target_latent is not None:
                 Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
-                print(f"[krea2edit] pre-encoding sources at target {Hh}x{Ww} "
+                print(f"[krea2edit] pre-encoding sources at target {Hh * 8}x{Ww * 8}px "
                       f"(before sampling, fit_mode={fit_mode})", flush=True)
                 _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode)
                 if source_image_b is not None:
@@ -357,8 +357,8 @@ class Krea2EditModelPatch:
                     state["announced"] = True
                     print(f"[krea2edit] pixel path ACTIVE (fit_mode={fit_mode})", flush=True)
                     if primed is not None and primed != (Hh, Ww):
-                        print(f"[krea2edit] WARNING: 'target_latent' is {primed[0]}x{primed[1]} but "
-                              f"sampling is at {Hh}x{Ww} — the pre-encode is unused and the VAE "
+                        print(f"[krea2edit] WARNING: 'target_latent' is {primed[0] * 8}x{primed[1] * 8}px but "
+                              f"sampling is at {Hh * 8}x{Ww * 8}px — the pre-encode is unused and the VAE "
                               f"will run mid-sampling. Wire the SAME latent that feeds KSampler.",
                               flush=True)
                 lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode))

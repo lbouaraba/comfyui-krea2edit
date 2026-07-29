@@ -4,6 +4,20 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## v1.2.5 — 2026-07-29
+
+### Added
+- **`target_latent` input on the patch node** (#15 — thanks @ethanfel, first outside
+  code contribution!): wire the same latent that feeds `KSampler.latent_image` and the
+  pixel path VAE-encodes the source at node-execution time instead of on the first
+  sampling step. Without it, that mid-sampling encode can make ComfyUI evict part of
+  the resident diffusion model on VRAM-tight setups — every remaining step then
+  streams weights from CPU. Optional; unwired behavior is unchanged. See the README
+  section "Pixel path and VRAM".
+
+### Fixed
+- Pre-encode console messages now report resolutions in pixels, not latent units.
+
 ## v1.2.4 — 2026-07-29
 
 Node-only update (no new weights) — recommended for everyone on v1.2 weights.
