@@ -36,6 +36,10 @@ in-context tokens (RoPE frame 1). Inputs:
 - `vae` + `source_image` *(optional, recommended)* — the blur-proof pixel path: give
   the raw image (and VAE) and the node fits it to the target grid in pixel space.
   Required for `fit_mode: fit`.
+- `target_latent` *(optional, recommended whenever you use the pixel path)* — wire the
+  **same** latent you feed `KSampler.latent_image`. It only tells the node the output
+  resolution ahead of time, so the source can be VAE-encoded here instead of on the first
+  sampling step. Skipping it can cost real speed — see [Pixel path and VRAM](#pixel-path-and-vram).
 - `fit_mode` *(default `fit`)* — how a source fits a mismatched output aspect ratio.
   `fit` = training-matched resample at a centered offset (v1.2); `crop` = center-crop,
   the v1/v1.1-legacy geometry (use with older weights).
@@ -67,7 +71,8 @@ UNETLoader ── LoraLoaderModelOnly (krea2_identity_edit_v1_2 @1.0) ── Kre
 Krea2EditModelPatch ── KSampler.model
 Krea2EditGroundedEncode ── KSampler.positive
 Krea2EditGroundedEncode (empty prompt, same image) ── KSampler.negative
-EmptySD3LatentImage ── KSampler.latent_image
+EmptySD3LatentImage ─┬─ KSampler.latent_image
+                     └─ Krea2EditModelPatch.target_latent   (when using vae + source_image)
 ```
 
 Example workflow in `workflows/`: `krea2_identity_edit.json` — single-image editor by
@@ -94,6 +99,40 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    the main inputs, subject B on the `_b` inputs) rather than adding them one at a time —
    simultaneous placement is currently more reliable than chaining separate edits. Face
    separation is still imperfect and a focus for future versions.
+8. **Wire `target_latent` if you use `vae` + `source_image`** — see below.
+
+## Pixel path and VRAM
+
+The pixel path has to VAE-encode the source at the output resolution. Without
+`target_latent` the node doesn't know that resolution until sampling starts, so the
+encode runs on the first step — and `vae.encode` asks ComfyUI for VRAM at a moment when
+the diffusion model is already resident and mid-run. ComfyUI frees room by partially
+offloading whatever is loaded, the sampler included, and nothing loads it back (it loads
+once, before its loop). The rest of the run then streams weights from CPU on every step.
+
+Wiring `target_latent` moves the encode to node-execution time, restoring the normal
+`VAEEncode → KSampler` order where the sampler evicts the VAE rather than the reverse.
+The encode is cached either way, so this is purely about *when* it happens.
+
+If you have VRAM headroom for the model and the VAE at once, nothing gets offloaded and
+neither wiring costs you anything — which is why this only bites some setups. Wire it
+anyway; it's free.
+
+The console tells you which path you got:
+
+```
+[krea2edit] pre-encoding sources at target 128x128 (before sampling, fit_mode=fit)   <- good
+[krea2edit] NOTE: connect 'target_latent' ...                                        <- encode will land mid-sampling
+```
+
+**Measure over 20+ steps, not 1.** The source still has to be VAE-encoded either way —
+`target_latent` only changes *when*. What it removes is a per-step penalty, so it can
+only show up across many steps. A 1-step run is almost entirely fixed overhead (model
+load, text encode, VAE encode/decode) and will show no difference at all.
+
+A third option is to skip the pixel path entirely: resize your source image to exactly
+the output resolution and feed only `source_latent`. At matched resolution the latent
+path does no resampling and produces the same reference geometry.
 
 ## License / credits
 
