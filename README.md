@@ -8,7 +8,7 @@ into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was t
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
 🧰 **Training code is public:** [krea2edit-trainer](https://github.com/lbouaraba/krea2edit-trainer) — the ai-toolkit extension these LoRAs were trained with, geometry-matched to the nodes, with measured consumer-GPU VRAM requirements.
-
+https://huggingface.co/conradlocke/krea2-identity-edit/tree/main
 ## Model versions
 
 See [CHANGELOG.md](CHANGELOG.md) — **v1.2 is recommended** (better face likeness,
@@ -24,7 +24,7 @@ git clone https://github.com/lbouaraba/comfyui-krea2edit
 
 Requirements: a ComfyUI version with native Krea 2 support, the Krea 2 model
 (Raw or Turbo), the Qwen3-VL 4B text encoder used by Krea 2, and the Krea 2 Identity Edit
-LoRA (`krea2_identity_edit_v1_2.safetensors`). No extra Python dependencies.
+LoRA (`krea2_identity_edit_v1_2.safetensors`, e.g. from [huggingface](https://huggingface.co/conradlocke/krea2-identity-edit/tree/main)). No extra Python dependencies.
 
 ## Nodes
 
