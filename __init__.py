@@ -22,9 +22,15 @@ from einops import rearrange
 import comfy.patcher_extension
 import comfy.utils
 import comfy.ldm.common_dit
+import comfy.model_management
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import apply_rope
 from comfy.ldm.modules.attention import optimized_attention_masked
+
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except Exception:
+    _flash_attn_func = None
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -168,6 +174,121 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     return bias
 
 
+# -------------------------------------------------------------------------------------------------
+# Flash-attention-compatible ref_boost (issue #6).
+#
+# _ref_attn_bias expresses the boost as an additive logit bias on [target rows x ref cols].
+# ComfyUI's flash backend (`--use-flash-attention`) refuses ANY mask
+# ("Mask must not be set for Flash attention") and silently falls back to SDPA with a
+# materialized (L,L) bias: warning spam per block per step and ~2x slower sampling.
+# Instead of handing the bias to the kernel, we keep every attention call MASKLESS and
+# reconstruct the biased softmax exactly from flash's returned logsumexp:
+#
+#   softmax with +log(b) on column set S (for the boosted rows) equals
+#     out' = [ out_full + (b-1) * P_S * out_S ] / [ 1 + (b-1) * P_S ]
+#   where out_full / out_S are maskless softmax attention over all keys / S only, and
+#   P_S = exp(lse_S - lse_full) is the full softmax's probability mass on S.
+#
+# Multiple boosted sets (scene/subject refs) accumulate in numerator and denominator.
+# Exact algebra, zero masks, flash stays on. Hooked in via the stock
+# `transformer_options["optimized_attention_override"]` dispatch in comfy's wrap_attn.
+_FLASH_BIAS_ROW_CHUNK = 1024   # rows per correction chunk: caps fp32 temp memory
+
+
+def _bias_to_sets(mask):
+    """Parse the additive bias built by _ref_attn_bias into (sets, rows):
+    sets = [(boost b_i, bool cols (Lk,)), ...] per distinct nonzero logit value,
+    rows = bool (Lq,) marking rows that carry the bias. Returns None for anything
+    else (bool masks, foreign structures) so the stock masked path handles them."""
+    m = mask
+    if m.ndim == 2:
+        m = m[None, None]
+    elif m.ndim == 3:
+        m = m[:, None]
+    if m.ndim != 4 or not torch.is_floating_point(m):
+        return None
+    m = m[0, 0]                                  # (Lq, Lk); _ref_attn_bias broadcasts over B/H
+    rows = m != 0
+    if not bool(rows.any()):
+        return None
+    rows = rows.any(dim=1)
+    template = m[int(rows.float().argmax())]      # boosted rows share one bias row by construction
+    sets = []
+    for lam in template[template != 0].unique():
+        b = float(lam.exp())
+        if b != 1.0:
+            sets.append((b, template == lam))
+    if not sets:
+        return None
+    return sets, rows
+
+
+def _make_flash_bias_override(prev_override):
+    """Build an `optimized_attention_override` (comfy.ldm.modules.attention.wrap_attn
+    protocol) that computes _ref_attn_bias-style additive-bias attention with maskless
+    flash calls. `prev_override`, if given, stays in the delegation chain."""
+    def _flash_bias_attention(orig, q, k, v, heads, mask=None, skip_reshape=False,
+                              skip_output_reshape=False, **kwargs):
+        def fallback():
+            target = prev_override if prev_override is not None else orig
+            return target(q, k, v, heads, mask=mask, skip_reshape=skip_reshape,
+                          skip_output_reshape=skip_output_reshape, **kwargs)
+
+        if (mask is None or not skip_reshape or _flash_attn_func is None
+                or not torch.is_floating_point(mask)
+                or q.device.type != "cuda"
+                or q.dtype not in (torch.float16, torch.bfloat16)):
+            return fallback()
+        parsed = _bias_to_sets(mask)
+        if parsed is None:
+            return fallback()
+        sets, rows = parsed
+
+        B, H, Lq, Dh = q.shape
+        if k.shape[1] != H:  # GQA safety: krea2 expands kv before the call, others may not
+            rep = H // k.shape[1]
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        qf, kf, vf = (t.transpose(1, 2) for t in (q, k, v))     # (B, S, H, D) for flash
+        scale = kwargs.get("scale", None)
+        out, lse_full, _ = _flash_attn_func(qf, kf, vf, softmax_scale=scale, return_attn_probs=True)
+
+        def span(boolmask):
+            """bool mask -> contiguous slice (a VIEW) or index tensor."""
+            i = boolmask.nonzero(as_tuple=True)[0]
+            if i.numel() and bool(i[1:].eq(i[:-1] + 1).all()):
+                return slice(int(i[0]), int(i[-1]) + 1)
+            return i
+
+        # gather boosted keys/values once per set (views for contiguous ref blocks)
+        sets_g = [(b, kf[:, s], vf[:, s]) for b, s in ((b, span(c)) for b, c in sets)]
+        rows_i = rows.nonzero(as_tuple=True)[0]
+        if rows_i.numel() and bool(rows_i[1:].eq(rows_i[:-1] + 1).all()):
+            r0, r1 = int(rows_i[0]), int(rows_i[-1]) + 1
+            chunks = [slice(s, min(s + _FLASH_BIAS_ROW_CHUNK, r1))
+                      for s in range(r0, r1, _FLASH_BIAS_ROW_CHUNK)]
+        else:
+            chunks = [rows_i[c0:c0 + _FLASH_BIAS_ROW_CHUNK]
+                      for c0 in range(0, rows_i.numel(), _FLASH_BIAS_ROW_CHUNK)]
+
+        for chunk in chunks:                                     # fp32 temp stays chunk-sized
+            acc = out[:, chunk].float()                          # (B, C, H, D)
+            den = None
+            for b, ks, vs in sets_g:
+                out_s, lse_s, _ = _flash_attn_func(qf[:, chunk], ks, vs,
+                                                   softmax_scale=scale, return_attn_probs=True)
+                w = (lse_s - lse_full[:, :, chunk]).exp_() * (b - 1.0)   # (B, H, C)
+                acc = acc + w.permute(0, 2, 1).unsqueeze(-1) * out_s.float()
+                den = w if den is None else den + w
+            if den is not None:
+                out[:, chunk] = (acc / (1.0 + den.permute(0, 2, 1).unsqueeze(-1))).to(out.dtype)
+
+        if not skip_output_reshape:
+            out = out.reshape(B, Lq, H * Dh)     # flash layout (B, L, H, D) -> (B, L, H*D)
+        return out
+    return _flash_bias_attention
+
+
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
                        ref_native=False, pos_mode="anchor"):
@@ -244,8 +365,26 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
                                    [si.shape[1] for si in src_imgs], tgtlen,
                                    src_grids, combined.device, combined.dtype)
 
-    for block in m.blocks:
-        combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    # Flash-attention path (#6): never hand the bias to the attention kernel —
+    # comfy's flash backend rejects masks outright and drops to slow masked SDPA.
+    # While flash attention is the active backend (and usable here), swap in the
+    # override that rebuilds the biased softmax from maskless flash calls.
+    use_flash_bias = (attn_bias is not None
+                      and comfy.model_management.flash_attention_enabled()
+                      and _flash_attn_func is not None)
+    prev_bias_override = None
+    if use_flash_bias:
+        prev_bias_override = transformer_options.get("optimized_attention_override", None)
+        transformer_options["optimized_attention_override"] = _make_flash_bias_override(prev_bias_override)
+    try:
+        for block in m.blocks:
+            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    finally:
+        if use_flash_bias:
+            if prev_bias_override is None:
+                transformer_options.pop("optimized_attention_override", None)
+            else:
+                transformer_options["optimized_attention_override"] = prev_bias_override
 
     final = m.last(combined, t)
     out = final[:, txtlen + srclen: txtlen + srclen + tgtlen, :]         # target tokens only

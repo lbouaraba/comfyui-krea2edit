@@ -4,6 +4,21 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## v1.2.6 — 2026-08-15
+
+### Fixed
+- **`ref_boost` no longer breaks Flash Attention (#6).** With
+  `--use-flash-attention`, the boost's attention bias made every DiT block warn
+  `Flash Attention failed, using default SDPA: Mask must not be set for Flash attention`
+  and fall back to slow masked SDPA (~2x slower steps). The bias is now applied through
+  a flash-compatible `optimized_attention_override`: every attention call stays
+  maskless and the biased softmax is rebuilt exactly from flash's logsumexp
+  (`out' = [out + (b-1)*P_S*out_S] / [1 + (b-1)*P_S]`). ~1.6x faster boosted steps at
+  1024px on a 3090, numerically closer to the fp32 ideal than the old fallback
+  (max err 5e-4 vs 3e-3). Unchanged behavior when flash attention is off, `ref_boost`
+  is 1.0, or `flash_attn` is missing. New regression tests in
+  `tests/test_flash_bias_attention.py`.
+
 ## v1.2.5 — 2026-07-29
 
 ### Added
