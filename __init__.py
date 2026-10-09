@@ -168,8 +168,26 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     return bias
 
 
+def _parse_boosts(text):
+    """'2, 3;0.5' -> [2.0, 3.0, 0.5]; empty -> []."""
+    return [float(v) for v in (text or "").replace(";", ",").split(",") if v.strip()]
+
+
+def _resolve_boosts(nsrc, ref_boost=1.0, ref_boost_a=1.0, ref_boosts=None):
+    """Per-ref boost list in connection order.
+
+    Default: the last ref (subject; the only ref in single-ref) gets ref_boost, earlier
+    refs (scene) get ref_boost_a. An explicit ref_boosts list overrides entry by
+    entry; missing tail entries keep the default, extra entries are ignored.
+    """
+    boosts = [ref_boost_a] * (nsrc - 1) + [ref_boost]
+    if ref_boosts:
+        boosts = [ref_boosts[i] if i < len(ref_boosts) else b for i, b in enumerate(boosts)]
+    return boosts
+
+
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
-                       ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
+                       ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None, ref_boosts=None,
                        ref_native=False, pos_mode="anchor"):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
@@ -237,9 +255,8 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     freqs = m.pe_embedder(pos)
 
     attn_bias = None
-    if ref_boost != 1.0 or ref_boost_a != 1.0:
-        # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
-        boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
+    boosts = _resolve_boosts(len(src_imgs), ref_boost, ref_boost_a, ref_boosts)
+    if any(b != 1.0 for b in boosts):
         attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen,
                                    [si.shape[1] for si in src_imgs], tgtlen,
                                    src_grids, combined.device, combined.dtype)
@@ -278,6 +295,11 @@ class Krea2EditModelPatch:
             # declared last on purpose: appending keeps every existing socket index put,
             # so workflows saved before this input still reload with their links intact.
             "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image. Lets the node VAE-encode the source here, before sampling starts, instead of on the first step — otherwise the VAE is pulled onto the GPU mid-sampling and can evict part of the diffusion model, slowing every remaining step on VRAM-tight setups"}),
+            # extra refs, image path only (needs vae + source_image).
+            # Order on the RoPE frames: a, b, c, d — the LAST connected one gets ref_boost.
+            "source_image_c": ("IMAGE", {"tooltip": "3rd reference as IMAGE (with vae) — untrained, experimental"}),
+            "source_image_d": ("IMAGE", {"tooltip": "4th reference as IMAGE (with vae) — untrained, experimental"}),
+            "ref_boosts": ("STRING", {"default": "", "tooltip": "per-reference boost, comma-separated in connection order (a, b, c, d), e.g. '2,3,0.5'. Non-empty overrides ref_boost / ref_boost_a; missing entries keep them"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -287,7 +309,8 @@ class Krea2EditModelPatch:
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit", target_latent=None, **_future):
+              source_image_b=None, fit_mode="fit", target_latent=None,
+              source_image_c=None, source_image_d=None, ref_boosts="", **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
@@ -300,6 +323,12 @@ class Krea2EditModelPatch:
         if source_latent_b is not None:
             src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
 
+        extra_imgs = [(tag, img) for tag, img in (("c", source_image_c), ("d", source_image_d)) if img is not None]
+        if extra_imgs and (vae is None or source_image is None):
+            raise ValueError("[krea2edit] source_image_c/_d need vae + source_image (pixel path)")
+        boost_list = _parse_boosts(ref_boosts)
+        if boost_list:
+            print(f"[krea2edit] per-ref boosts: {boost_list}", flush=True)
         px_cache = {}   # pixel-path encoded sources, keyed per target resolution
         mm = model.model  # for process_latent_in on the pixel path
         state = {"announced": False}
@@ -325,6 +354,8 @@ class Krea2EditModelPatch:
                 _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode)
                 if source_image_b is not None:
                     _fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode)
+                for tag, img in extra_imgs:
+                    _fit_encode_image(img, vae, Hh, Ww, px_cache, (tag, Hh, Ww), fit_mode)
                 primed = (Hh, Ww)
             else:
                 print("[krea2edit] NOTE: connect 'target_latent' (the same latent that feeds "
@@ -364,9 +395,14 @@ class Krea2EditModelPatch:
                 lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode))
                 if source_image_b is not None:
                     lat = [lat, mm.process_latent_in(_fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode))]
+                if extra_imgs:
+                    lat = lat if isinstance(lat, list) else [lat]
+                    for tag, img in extra_imgs:
+                        lat.append(mm.process_latent_in(_fit_encode_image(img, vae, Hh, Ww, px_cache, (tag, Hh, Ww), fit_mode)))
                 src = lat
             v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
                                    ref_boost=ref_boost, ref_boost_a=ref_boost_a,
+                                   ref_boosts=boost_list,
                                    ref_boost_mask=ref_boost_mask,
                                    ref_native=(fit_mode == "fit" and vae is not None
                                                and source_image is not None),
@@ -428,6 +464,9 @@ class Krea2EditGroundedEncode:
                                           "tooltip": "cap longest side fed to Qwen3-VL; 0 = native"}),
                 "system_prompt": ("STRING", {"multiline": True, "default": "",
                                               "tooltip": "advanced (optional): override the grounding system prompt (empty = training default). Steers what the vision encoder attends to, e.g. facial identity detail."}),
+                # extra refs, same order as the model patch.
+                "image_c": ("IMAGE", {"tooltip": "3rd reference — untrained, experimental"}),
+                "image_d": ("IMAGE", {"tooltip": "4th reference — untrained, experimental"}),
             },
         }
 
@@ -452,7 +491,8 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt="", **_future):
+    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt="",
+               image_c=None, image_d=None, **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). Update comfyui-krea2edit and restart "
@@ -461,8 +501,9 @@ class Krea2EditGroundedEncode:
             tokens = clip.tokenize(prompt)
             return (clip.encode_from_tokens_scheduled(tokens),)
         imgs = [self._prep(image, grounding_px)]
-        if image_b is not None:
-            imgs.append(self._prep(image_b, grounding_px))
+        for extra in (image_b, image_c, image_d):
+            if extra is not None:
+                imgs.append(self._prep(extra, grounding_px))
         template = self._template(len(imgs), system_prompt)
         tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
         return (clip.encode_from_tokens_scheduled(tokens),)
