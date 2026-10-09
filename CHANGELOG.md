@@ -4,6 +4,20 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## Unreleased
+
+### Added
+- **Up to 4 references** on the patch node: `source_image_c`, `source_image_d` (pixel
+  path only — needs `vae` + `source_image`), and `image_c`, `image_d` on the grounded
+  encode. The forward was already N-ref (RoPE frame i+1 per ref); only the sockets
+  were missing. Untrained beyond two refs (the LoRA saw scene+subject pairs), but the
+  3rd ref is honored: swapping it changes the result accordingly.
+- **`ref_boosts`** — per-reference boost as a comma list in connection order
+  (`a,b,c,d`, e.g. `2,3,0.5`). Non-empty overrides `ref_boost` / `ref_boost_a`; missing
+  tail entries keep them. Needed because a boosted "dressed model" ref also pulls her
+  face onto the target; `2,3,0.5` keeps the target identity.
+- New inputs are appended last, so saved workflows keep their socket indices.
+
 ## v1.2.5 — 2026-07-29
 
 ### Added

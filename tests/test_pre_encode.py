@@ -231,6 +231,44 @@ def test_target_latent_without_pixel_path_is_inert():
     assert seen[0].shape == (1, 4, 64, 64)
 
 
+def test_four_references_pre_encoded_in_order():
+    """c/d refs ride the same pixel path, appended after a, b."""
+    mod = _load_pack()
+    seen = []
+    kw = []
+    mod.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: (seen.append(src), kw.append(k))
+    vae = _FakeVAE()
+    imgs = [_image() * v for v in (0.1, 0.2, 0.3, 0.4)]
+    wrapper = _patch(mod, vae=vae, source_image=imgs[0], source_image_b=imgs[1],
+                     source_image_c=imgs[2], source_image_d=imgs[3],
+                     target_latent=_latent(), ref_boosts="2, 3;0.5")
+    assert len(vae.calls) == 4, "all four refs pre-encoded"
+    _run_steps(wrapper)
+    assert len(vae.calls) == 4
+    assert isinstance(seen[0], list) and len(seen[0]) == 4
+    assert kw[0]["ref_boosts"] == [2.0, 3.0, 0.5]
+
+
+def test_extra_refs_need_pixel_path():
+    mod = _load_pack()
+    try:
+        _patch(mod, source_image_c=_image())
+    except ValueError:
+        return
+    raise AssertionError("source_image_c without vae + source_image must fail loudly")
+
+
+def test_resolve_boosts():
+    mod = _load_pack()
+    assert mod._resolve_boosts(1, 3.0, 2.0) == [3.0]
+    assert mod._resolve_boosts(3, 3.0, 2.0) == [2.0, 2.0, 3.0]
+    assert mod._resolve_boosts(3, 3.0, 2.0, [2.0, 3.0, 0.5]) == [2.0, 3.0, 0.5]
+    assert mod._resolve_boosts(3, 3.0, 2.0, [1.0]) == [1.0, 2.0, 3.0], "missing tail keeps defaults"
+    assert mod._resolve_boosts(2, 3.0, 2.0, [1.0, 1.0, 9.0]) == [1.0, 1.0], "extra entries ignored"
+    assert mod._parse_boosts("") == []
+    assert mod._parse_boosts(" 2, 3;0.5 ") == [2.0, 3.0, 0.5]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
