@@ -47,6 +47,11 @@ in-context tokens (RoPE frame 1). Inputs:
   the v1/v1.1-legacy geometry (use with older weights).
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
+- `boost_attention` *(default `split`)* — how a boost other than 1.0 is computed. `split`
+  rebuilds the boosted softmax exactly from maskless calls to your attention backend, so
+  Comfy Kitchen / Sage / Flash / PyTorch keep their fast kernels. `dense_bias` is the
+  original dense (L, L) bias, which forces a slower masked kernel. Same result, up to
+  float rounding.
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while

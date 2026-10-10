@@ -168,9 +168,84 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     return bias
 
 
+def _boost_sets(boosts, boost_mask, txtlen, slens, mask_hw, device):
+    """The column selection of _ref_attn_bias as [(boost, cols)] instead of a dense
+    (L, L) bias. cols is a slice for a whole reference block, or an index tensor when
+    boost_mask restricts the last reference to a region."""
+    offs = [txtlen]
+    for sl in slens:
+        offs.append(offs[-1] + sl)
+    sets = []
+    for i, b in enumerate(boosts):
+        if b == 1.0:
+            continue
+        off, sl = offs[i], slens[i]
+        if boost_mask is not None and i == len(slens) - 1 and mask_hw is not None:
+            mask = boost_mask[:1]
+            if mask.ndim == 2:
+                mask = mask[None]
+            mask = F.interpolate(mask[None].float(), size=mask_hw[i], mode="area")[0, 0]
+            cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
+        else:
+            cols = slice(off, off + sl)
+        sets.append((float(b), cols))
+    return sets, offs[-1]
+
+
+def _make_split_boost_override(sets, rows0, prev_override):
+    """`optimized_attention_override` computing ref_boost attention from MASKLESS calls
+    to whatever attention backend is active (Comfy Kitchen, Sage, Flash, PyTorch...).
+
+    The boost is an additive log(b) logit bias on [target rows x reference cols S].
+    Handing that dense (L, L) bias to the kernel forces a slow masked path (or, with
+    Flash, a fallback to masked SDPA, see #6). Instead, with A the unbiased softmax:
+        A (V * 1_S) = P_S * out_S      and      A 1_S = P_S
+    so the biased output is exactly
+        out' = (A V + sum_i (b_i - 1) A (V * 1_Si)) / (1 + sum_i (b_i - 1) A 1_Si)
+    for the target rows (other rows are unbiased). That is one full maskless call plus
+    one call over the target rows only, with two extra head groups per boosted set.
+    """
+    call = prev_override or (lambda f, *a, **kw: f(*a, **kw))
+
+    def _attention(func, q, k, v, heads, mask=None, skip_reshape=False,
+                   skip_output_reshape=False, **kwargs):
+        if mask is not None or not skip_reshape:
+            # not the call shape this override was built for: leave it untouched
+            return call(func, q, k, v, heads, mask=mask, skip_reshape=skip_reshape,
+                        skip_output_reshape=skip_output_reshape, **kwargs)
+        B, H, L, Dh = q.shape
+        if k.shape[1] != H:  # GQA: krea2 expands kv before the call, others may not
+            rep = H // k.shape[1]
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        out = call(func, q, k, v, heads, mask=None, skip_reshape=True,
+                   skip_output_reshape=True, **kwargs)
+        vs = []
+        for _, cols in sets:
+            ind = torch.zeros(1, 1, L, 1, device=v.device, dtype=v.dtype)
+            ind[:, :, cols] = 1
+            vs += [v * ind, ind.expand(B, H, L, Dh)]
+        n = len(vs)
+        y = call(func, q[:, :, rows0:].repeat(1, n, 1, 1), k.repeat(1, n, 1, 1),
+                 torch.cat(vs, dim=1), heads * n, mask=None, skip_reshape=True,
+                 skip_output_reshape=True, **kwargs)
+        acc = out[:, :, rows0:].float()
+        den = torch.ones(B, H, acc.shape[2], 1, device=acc.device, dtype=torch.float32)
+        for i, (b, _) in enumerate(sets):
+            acc.add_(y[:, (2 * i) * H:(2 * i + 1) * H].float(), alpha=b - 1.0)
+            den.add_(y[:, (2 * i + 1) * H:(2 * i + 2) * H].float().mean(-1, keepdim=True),
+                     alpha=b - 1.0)
+        out = out.clone()
+        out[:, :, rows0:] = (acc / den).to(out.dtype)
+        if skip_output_reshape:
+            return out
+        return out.transpose(1, 2).reshape(B, L, H * Dh)
+    return _attention
+
+
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
-                       ref_native=False, pos_mode="anchor"):
+                       ref_native=False, pos_mode="anchor", boost_attention="split"):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -237,15 +312,31 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     freqs = m.pe_embedder(pos)
 
     attn_bias = None
+    override = None
     if ref_boost != 1.0 or ref_boost_a != 1.0:
         # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
         boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
-        attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen,
-                                   [si.shape[1] for si in src_imgs], tgtlen,
-                                   src_grids, combined.device, combined.dtype)
+        slens = [si.shape[1] for si in src_imgs]
+        if boost_attention == "split":
+            sets, rows0 = _boost_sets(boosts, ref_boost_mask, txtlen, slens, src_grids, combined.device)
+            override = _make_split_boost_override(
+                sets, rows0, transformer_options.get("optimized_attention_override"))
+        else:
+            attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen, slens, tgtlen,
+                                       src_grids, combined.device, combined.dtype)
 
-    for block in m.blocks:
-        combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    prev_override = transformer_options.get("optimized_attention_override")
+    if override is not None:
+        transformer_options["optimized_attention_override"] = override
+    try:
+        for block in m.blocks:
+            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    finally:
+        if override is not None:
+            if prev_override is None:
+                transformer_options.pop("optimized_attention_override", None)
+            else:
+                transformer_options["optimized_attention_override"] = prev_override
 
     final = m.last(combined, t)
     out = final[:, txtlen + srclen: txtlen + srclen + tgtlen, :]         # target tokens only
@@ -278,6 +369,7 @@ class Krea2EditModelPatch:
             # declared last on purpose: appending keeps every existing socket index put,
             # so workflows saved before this input still reload with their links intact.
             "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image. Lets the node VAE-encode the source here, before sampling starts, instead of on the first step — otherwise the VAE is pulled onto the GPU mid-sampling and can evict part of the diffusion model, slowing every remaining step on VRAM-tight setups"}),
+            "boost_attention": (["split", "dense_bias"], {"default": "split", "tooltip": "how ref_boost != 1 is computed. split (default) = exact reconstruction from maskless calls to the active attention backend (Comfy Kitchen / Sage / Flash / PyTorch keep their fast kernels); dense_bias = the original (L, L) additive bias, which forces a slower masked kernel"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -287,7 +379,8 @@ class Krea2EditModelPatch:
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit", target_latent=None, **_future):
+              source_image_b=None, fit_mode="fit", target_latent=None,
+              boost_attention="split", **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
@@ -367,7 +460,7 @@ class Krea2EditModelPatch:
                 src = lat
             v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
                                    ref_boost=ref_boost, ref_boost_a=ref_boost_a,
-                                   ref_boost_mask=ref_boost_mask,
+                                   ref_boost_mask=ref_boost_mask, boost_attention=boost_attention,
                                    ref_native=(fit_mode == "fit" and vae is not None
                                                and source_image is not None),
                                    pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
