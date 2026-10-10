@@ -4,6 +4,22 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## Unreleased
+
+### Changed
+- **`ref_boost` no longer forces a slow masked attention kernel** (fixes #6). The boost
+  is an additive log(b) logit bias on the target rows over the reference columns;
+  passing it to the kernel as a dense (L, L) bias made every block fall back to a
+  masked path. The new `boost_attention: split` (default) computes the same softmax
+  exactly from maskless calls to the active backend: with A the unbiased attention,
+  A(V·1_S) = P_S·out_S and A·1_S = P_S, so one full call plus one call over the target
+  rows (two extra head groups per boosted reference) reconstructs the boosted output.
+  Works with any backend (Comfy Kitchen int8, Sage, Flash, PyTorch), single- and
+  two-reference edits, and `ref_boost_mask`. `dense_bias` keeps the previous behavior.
+  Measured on an RTX 5060 Ti 16 GB (Comfy Kitchen int8 attention, Turbo, 8 steps,
+  720×1280): boost 4 with one reference 36.4 s → 28.1 s (no boost: 22.4 s); two
+  references with a boost on the second 70.1 s → 46.8 s (no boost: 44.8 s).
+
 ## v1.2.5 — 2026-07-29
 
 ### Added
