@@ -175,6 +175,8 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     multiplying those keys' post-softmax attention weight before renormalization.
     boost_mask (ComfyUI MASK, ref-image pixel space) restricts the LAST ref's boost
     to a region (e.g. the face).
+    Returns None when no column ends up boosted (e.g. an empty boost_mask): an all-zero
+    bias changes nothing but still forces every block onto a masked attention kernel.
     """
     nsrc = len(slens)
     offs = [txtlen]
@@ -182,7 +184,7 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
         offs.append(offs[-1] + sl)
     rows0 = offs[-1]
     L = rows0 + tgtlen
-    bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
+    bias = None
     for i, b in enumerate(boosts):
         if b == 1.0:
             continue
@@ -195,6 +197,10 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
             cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
         else:
             cols = torch.arange(off, off + sl, device=device)
+        if cols.numel() == 0:
+            continue
+        if bias is None:
+            bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
         bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
     return bias
 
@@ -334,6 +340,9 @@ class Krea2EditModelPatch:
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
                   f"installed node pack. Update comfyui-krea2edit (Manager -> Update, or git "
                   f"pull) and restart ComfyUI. Continuing without them.", flush=True)
+        if ref_boost != 1.0 and ref_boost_mask is not None and ref_boost_mask.max() <= 0.5:
+            print("[krea2edit] WARNING: ref_boost_mask is empty, so ref_boost is not applied. "
+                  "Paint the region to boost, or disconnect the mask to boost the whole reference.", flush=True)
         if not (ref_position.startswith("aligned") and ref_position_a.startswith("aligned")):
             print(f"[krea2edit] reference placement: last ref={ref_position!r}, "
                   f"first ref={ref_position_a!r}", flush=True)
